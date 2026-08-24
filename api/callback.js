@@ -1,9 +1,7 @@
 export default async function handler(req, res) {
   console.log('=== ЗАПРОС ОТ ВК ===');
   console.log('Method:', req.method);
-  console.log('Body:', JSON.stringify(req.body));
 
-  // GET-запрос (проверка в браузере)
   if (req.method === 'GET') {
     return res.status(200).send('VK → TG bot is running');
   }
@@ -14,19 +12,19 @@ export default async function handler(req, res) {
 
   const data = req.body;
 
-  // Подтверждение сервера — просто возвращаем то, что прислал ВК в поле secret
+  // Подтверждение сервера
   if (data && data.type === 'confirmation') {
-    console.log('Отправляем подтверждение:', data.secret);
+    console.log('Подтверждение:', data.secret);
     return res.status(200).send(data.secret);
   }
 
   // Новый пост на стене
   if (data && data.type === 'wall_post_new') {
-    console.log('Получен новый пост');
+    console.log('=== ПОЛУЧЕН НОВЫЙ ПОСТ ===');
     try {
       await sendPostToTelegram(data.object);
     } catch (error) {
-      console.error('Ошибка при отправке:', error);
+      console.error('Ошибка:', error);
     }
   }
 
@@ -37,8 +35,13 @@ async function sendPostToTelegram(post) {
   const TG_TOKEN = process.env.TG_TOKEN;
   const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
-  if (!TG_TOKEN || !TG_CHAT_ID) {
-    console.error('Нет токена или ID чата');
+  // Проверка переменных
+  if (!TG_TOKEN) {
+    console.error('❌ ОШИБКА: TG_TOKEN не задан в переменных окружения Vercel');
+    return;
+  }
+  if (!TG_CHAT_ID) {
+    console.error('❌ ОШИБКА: TG_CHAT_ID не задан в переменных окружения Vercel');
     return;
   }
 
@@ -47,59 +50,122 @@ async function sendPostToTelegram(post) {
   const ownerId = post.owner_id;
   const postUrl = `https://vk.com/wall${ownerId}_${postId}`;
 
-  const caption = text
-    ? `${text}\n\n📎 Оригинал: ${postUrl}`
-    : `📎 ${postUrl}`;
-
   const attachments = post.attachments || [];
-  const photos = attachments
-    .filter(a => a.type === 'photo')
-    .map(a => a.photo)
-    .filter(p => p && p.sizes);
+  
+  console.log('Тип поста: текст =', text.length > 0, ', вложений =', attachments.length);
+  
+  // Анализируем тип вложения
+  if (attachments.length > 0) {
+    const attachment = attachments[0];
+    console.log('Тип вложения:', attachment.type);
 
-  // Если есть фото — отправляем как фото
-  if (photos.length > 0) {
-    const bestPhoto = photos[0].sizes.reduce((max, size) =>
-      size.width * size.height > max.width * max.height ? size : max
-    );
-
-    try {
-      const response = await fetch(
-        `https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`,
+    // КЛИП (вертикальное видео)
+    if (attachment.type === 'clip') {
+      const clip = attachment.clip;
+      const clipUrl = `https://vk.com/clip${clip.owner_id}_${clip.id}`;
+      const caption = `${clip.title || 'VK Клип'}\n${clip.description || ''}\n\n🎬 Клип: ${clipUrl}\n📎 Пост: ${postUrl}`.trim();
+      
+      // Пытаемся отправить превью + ссылку
+      const previewUrl = clip.first_frame?.[clip.first_frame.length - 1]?.url 
+                       || clip.image?.[clip.image.length - 1]?.url;
+      
+      if (previewUrl) {
+        const photoResult = await fetch(
+          `https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: TG_CHAT_ID,
+              photo: previewUrl,
+              caption: caption.substring(0, 1024),
+            }),
+          }
+        );
+        const result = await photoResult.json();
+        console.log('Клип отправлен как фото со ссылкой:', JSON.stringify(result));
+        if (result.ok) return;
+      }
+      
+      // Фолбэк — просто текстом
+      const textResult = await fetch(
+        `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: TG_CHAT_ID,
-            photo: bestPhoto.url,
-            caption: caption.substring(0, 1024),
+            text: caption.substring(0, 4096),
           }),
         }
       );
-      const result = await response.json();
-      console.log('Telegram (photo):', JSON.stringify(result));
-      if (result.ok) return;
-    } catch (error) {
-      console.error('Ошибка фото:', error);
+      console.log('Клип отправлен текстом:', JSON.stringify(await textResult.json()));
+      return;
+    }
+
+    // ФОТО
+    if (attachment.type === 'photo') {
+      const photo = attachment.photo;
+      if (photo && photo.sizes && photo.sizes.length > 0) {
+        const bestPhoto = photo.sizes.reduce((max, size) =>
+          size.width * size.height > max.width * max.height ? size : max
+        );
+        
+        const caption = `${text}\n\n📎 ${postUrl}`.trim();
+        
+        const response = await fetch(
+          `https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: TG_CHAT_ID,
+              photo: bestPhoto.url,
+              caption: caption.substring(0, 1024),
+            }),
+          }
+        );
+        console.log('Фото:', JSON.stringify(await response.json()));
+        return;
+      }
+    }
+
+    // ВИДЕО (обычное, не клип)
+    if (attachment.type === 'video') {
+      const video = attachment.video;
+      const videoUrl = `https://vk.com/video${video.owner_id}_${video.id}`;
+      const caption = `${text}\n\n🎬 Видео: ${videoUrl}\n📎 Пост: ${postUrl}`.trim();
+      
+      const response = await fetch(
+        `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: TG_CHAT_ID,
+            text: caption.substring(0, 4096),
+          }),
+        }
+      );
+      console.log('Видео:', JSON.stringify(await response.json()));
+      return;
     }
   }
 
-  // Иначе отправляем текстом
-  try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: TG_CHAT_ID,
-          text: caption.substring(0, 4096),
-        }),
-      }
-    );
-    const result = await response.json();
-    console.log('Telegram (text):', JSON.stringify(result));
-  } catch (error) {
-    console.error('Ошибка текста:', error);
-  }
+  // Обычный текст без вложений
+  const caption = `${text}\n\n📎 ${postUrl}`.trim() || `📎 ${postUrl}`;
+  
+  const response = await fetch(
+    `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text: caption.substring(0, 4096),
+      }),
+    }
+  );
+  const result = await response.json();
+  console.log('Текст:', JSON.stringify(result));
 }
