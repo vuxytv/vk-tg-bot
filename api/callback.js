@@ -14,13 +14,12 @@ export default async function handler(req, res) {
 
   // Подтверждение сервера
   if (data && data.type === 'confirmation') {
-    console.log('Подтверждение:', data.secret);
     return res.status(200).send(data.secret);
   }
 
   // Новый пост на стене
   if (data && data.type === 'wall_post_new') {
-    console.log('=== ПОЛУЧЕН НОВЫЙ ПОСТ ===');
+    console.log('=== НОВЫЙ ПОСТ ===');
     try {
       await sendPostToTelegram(data.object);
     } catch (error) {
@@ -34,14 +33,10 @@ export default async function handler(req, res) {
 async function sendPostToTelegram(post) {
   const TG_TOKEN = process.env.TG_TOKEN;
   const TG_CHAT_ID = process.env.TG_CHAT_ID;
+  const VK_TOKEN = process.env.VK_TOKEN;
 
-  // Проверка переменных
-  if (!TG_TOKEN) {
-    console.error('❌ ОШИБКА: TG_TOKEN не задан в переменных окружения Vercel');
-    return;
-  }
-  if (!TG_CHAT_ID) {
-    console.error('❌ ОШИБКА: TG_CHAT_ID не задан в переменных окружения Vercel');
+  if (!TG_TOKEN || !TG_CHAT_ID) {
+    console.error('❌ Нет TG_TOKEN или TG_CHAT_ID');
     return;
   }
 
@@ -49,28 +44,57 @@ async function sendPostToTelegram(post) {
   const postId = post.id;
   const ownerId = post.owner_id;
   const postUrl = `https://vk.com/wall${ownerId}_${postId}`;
-
   const attachments = post.attachments || [];
-  
-  console.log('Тип поста: текст =', text.length > 0, ', вложений =', attachments.length);
-  
-  // Анализируем тип вложения
+
+  console.log('Вложений:', attachments.length);
+
   if (attachments.length > 0) {
     const attachment = attachments[0];
     console.log('Тип вложения:', attachment.type);
 
-    // КЛИП (вертикальное видео)
+    // === VK CLIP (вертикальное короткое видео) ===
     if (attachment.type === 'clip') {
       const clip = attachment.clip;
-      const clipUrl = `https://vk.com/clip${clip.owner_id}_${clip.id}`;
-      const caption = `${clip.title || 'VK Клип'}\n${clip.description || ''}\n\n🎬 Клип: ${clipUrl}\n📎 Пост: ${postUrl}`.trim();
-      
-      // Пытаемся отправить превью + ссылку
-      const previewUrl = clip.first_frame?.[clip.first_frame.length - 1]?.url 
-                       || clip.image?.[clip.image.length - 1]?.url;
-      
+      console.log('Клип ID:', clip.id, 'Owner:', clip.owner_id);
+
+      // Получаем прямую ссылку на видео-файл через VK API
+      const videoFileUrl = await getClipFileUrl(clip.owner_id, clip.id, VK_TOKEN);
+
+      if (videoFileUrl) {
+        console.log('✅ Получена прямая ссылка на MP4');
+        const caption = `${clip.description || ''}\n\n📎 Пост: ${postUrl}`.trim();
+        
+        // Отправляем как НАТИВНОЕ видео в Telegram
+        const response = await fetch(
+          `https://api.telegram.org/bot${TG_TOKEN}/sendVideo`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: TG_CHAT_ID,
+              video: videoFileUrl,
+              caption: caption.substring(0, 1024),
+              supports_streaming: true,
+              width: clip.width || 720,
+              height: clip.height || 1280,
+              duration: clip.duration || 8,
+            }),
+          }
+        );
+        const result = await response.json();
+        console.log('Telegram sendVideo:', JSON.stringify(result));
+        
+        if (result.ok) return;
+        console.log('⚠️ sendVideo не сработал, пробуем запасной вариант');
+      } else {
+        console.log('⚠️ Не удалось получить прямую ссылку на файл клипа');
+      }
+
+      // Запасной вариант — отправляем как фото-превью со ссылкой
+      const previewUrl = clip.first_frame?.[clip.first_frame.length - 1]?.url;
       if (previewUrl) {
-        const photoResult = await fetch(
+        const caption = `🎬 ${clip.title || 'VK Клип'}\n${clip.description || ''}\n\n📎 Клип: https://vk.com/clip${clip.owner_id}_${clip.id}\n📎 Пост: ${postUrl}`.trim();
+        const fallbackResponse = await fetch(
           `https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`,
           {
             method: 'POST',
@@ -82,37 +106,19 @@ async function sendPostToTelegram(post) {
             }),
           }
         );
-        const result = await photoResult.json();
-        console.log('Клип отправлен как фото со ссылкой:', JSON.stringify(result));
-        if (result.ok) return;
+        console.log('Fallback (фото со ссылкой):', JSON.stringify(await fallbackResponse.json()));
       }
-      
-      // Фолбэк — просто текстом
-      const textResult = await fetch(
-        `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: TG_CHAT_ID,
-            text: caption.substring(0, 4096),
-          }),
-        }
-      );
-      console.log('Клип отправлен текстом:', JSON.stringify(await textResult.json()));
       return;
     }
 
-    // ФОТО
+    // === ФОТО ===
     if (attachment.type === 'photo') {
       const photo = attachment.photo;
-      if (photo && photo.sizes && photo.sizes.length > 0) {
+      if (photo?.sizes?.length > 0) {
         const bestPhoto = photo.sizes.reduce((max, size) =>
           size.width * size.height > max.width * max.height ? size : max
         );
-        
         const caption = `${text}\n\n📎 ${postUrl}`.trim();
-        
         const response = await fetch(
           `https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`,
           {
@@ -129,32 +135,10 @@ async function sendPostToTelegram(post) {
         return;
       }
     }
-
-    // ВИДЕО (обычное, не клип)
-    if (attachment.type === 'video') {
-      const video = attachment.video;
-      const videoUrl = `https://vk.com/video${video.owner_id}_${video.id}`;
-      const caption = `${text}\n\n🎬 Видео: ${videoUrl}\n📎 Пост: ${postUrl}`.trim();
-      
-      const response = await fetch(
-        `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: TG_CHAT_ID,
-            text: caption.substring(0, 4096),
-          }),
-        }
-      );
-      console.log('Видео:', JSON.stringify(await response.json()));
-      return;
-    }
   }
 
-  // Обычный текст без вложений
+  // Обычный текст
   const caption = `${text}\n\n📎 ${postUrl}`.trim() || `📎 ${postUrl}`;
-  
   const response = await fetch(
     `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
     {
@@ -166,6 +150,44 @@ async function sendPostToTelegram(post) {
       }),
     }
   );
-  const result = await response.json();
-  console.log('Текст:', JSON.stringify(result));
+  console.log('Текст:', JSON.stringify(await response.json()));
+}
+
+// Получает прямую ссылку на MP4-файл клипа через VK API
+async function getClipFileUrl(ownerId, videoId, vkToken) {
+  if (!vkToken) {
+    console.error('❌ VK_TOKEN не задан');
+    return null;
+  }
+
+  try {
+    const apiUrl = `https://api.vk.com/method/video.get?v=5.199&videos=${ownerId}_${videoId}&access_token=${vkToken}`;
+    console.log('Запрос к VK API video.get...');
+    
+    const response = await fetch(apiUrl);
+    const data = await response.json();
+
+    if (!data.response || !data.response.items || data.response.items.length === 0) {
+      console.log('VK API не вернул данные о видео:', JSON.stringify(data));
+      return null;
+    }
+
+    const video = data.response.items[0];
+    const files = video.files || {};
+    
+    console.log('Доступные качества:', Object.keys(files));
+    
+    // Берём лучшее качество (720p обычно достаточно для клипа)
+    const fileUrl = files.mp4_720 || files.mp4_480 || files.mp4_360 || files.mp4_240 || files.mp4_144;
+    
+    if (!fileUrl) {
+      console.log('Нет прямых ссылок на MP4 в ответе VK API');
+      return null;
+    }
+    
+    return fileUrl;
+  } catch (error) {
+    console.error('Ошибка VK API:', error);
+    return null;
+  }
 }
