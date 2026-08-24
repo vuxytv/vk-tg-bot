@@ -1,5 +1,4 @@
 export default async function handler(req, res) {
-  // Логируем всё, что приходит — для отладки
   console.log('=== ЗАПРОС ОТ ВК ===');
   console.log('Method:', req.method);
   console.log('Body:', JSON.stringify(req.body));
@@ -15,11 +14,10 @@ export default async function handler(req, res) {
 
   const data = req.body;
 
-  // Подтверждение сервера
+  // Подтверждение сервера — просто возвращаем то, что прислал ВК в поле secret
   if (data && data.type === 'confirmation') {
-    const confirmString = process.env.VK_CONFIRM;
-    console.log('Отправляем подтверждение:', confirmString);
-    return res.status(200).send(confirmString);
+    console.log('Отправляем подтверждение:', data.secret);
+    return res.status(200).send(data.secret);
   }
 
   // Новый пост на стене
@@ -32,7 +30,6 @@ export default async function handler(req, res) {
     }
   }
 
-  // ВК требует ответ "ok"
   return res.status(200).send('ok');
 }
 
@@ -80,10 +77,10 @@ async function sendPostToTelegram(post) {
         }
       );
       const result = await response.json();
-      console.log('Telegram response (photo):', JSON.stringify(result));
+      console.log('Telegram (photo):', JSON.stringify(result));
       if (result.ok) return;
     } catch (error) {
-      console.error('Ошибка отправки фото:', error);
+      console.error('Ошибка фото:', error);
     }
   }
 
@@ -101,8 +98,8 @@ async function sendPostToTelegram(post) {
       }
     );
     const result = await response.json();
-    console.log('Telegram response (text):', JSON.stringify(result));
+    console.log('Telegram (text):', JSON.stringify(result));
   } catch (error) {
-    console.error('Ошибка отправки текста:', error);
+    console.error('Ошибка текста:', error);
   }
 }
