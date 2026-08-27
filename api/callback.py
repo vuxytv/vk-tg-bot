@@ -1,43 +1,50 @@
 import json
 import os
-import requests
-from urllib.parse import urlencode
-import yt_dlp
-from io import BytesIO
+from http.server import BaseHTTPRequestHandler
 
-VK_TOKEN = os.environ.get("VK_TOKEN")
+import requests
+import yt_dlp
+
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
-def handler(request):
-    # GET — проверка работы
-    if request.method == "GET":
-        return ("VK → TG bot is running", 200, {"Content-Type": "text/plain"})
 
-    if request.method != "POST":
-        return ("Method not allowed", 405, {"Content-Type": "text/plain"})
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self._respond(200, "VK -> TG bot is running")
 
-    # Парсим тело запроса
-    try:
-        body = request.get_data(as_text=True)
-        data = json.loads(body)
-    except Exception as e:
-        print(f"Ошибка парсинга: {e}")
-        return ("ok", 200, {"Content-Type": "text/plain"})
-
-    # Подтверждение сервера
-    if data.get("type") == "confirmation":
-        return (data.get("secret", ""), 200, {"Content-Type": "text/plain"})
-
-    # Новый пост на стене
-    if data.get("type") == "wall_post_new":
-        print("=== НОВЫЙ ПОСТ ===")
+    def do_POST(self):
         try:
-            send_post_to_telegram(data.get("object", {}))
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            data = json.loads(body)
         except Exception as e:
-            print(f"Ошибка: {e}")
+            print("Ошибка парсинга:", e)
+            self._respond(200, "ok")
+            return
 
-    return ("ok", 200, {"Content-Type": "text/plain"})
+        # Подтверждение сервера для ВК
+        if data.get("type") == "confirmation":
+            self._respond(200, data.get("secret", ""))
+            return
+
+        # Новый пост на стене
+        if data.get("type") == "wall_post_new":
+            print("=== НОВЫЙ ПОСТ ===")
+            try:
+                send_post_to_telegram(data.get("object", {}))
+            except Exception as e:
+                print("Ошибка обработки поста:", e)
+
+        self._respond(200, "ok")
+
+    def _respond(self, code, text):
+        payload = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
 
 def send_post_to_telegram(post):
@@ -53,155 +60,155 @@ def send_post_to_telegram(post):
 
     if attachments:
         attachment = attachments[0]
-        print(f"Тип вложения: {attachment.get('type')}")
+        print("Тип вложения:", attachment.get("type"))
 
         # === VK CLIP ===
         if attachment.get("type") == "clip":
             clip = attachment.get("clip", {})
             clip_url = f"https://vk.com/clip{clip.get('owner_id')}_{clip.get('id')}"
-            print(f"Клип URL: {clip_url}")
+            print("Клип URL:", clip_url)
 
-            # Скачиваем MP4 через yt-dlp прямо в память
-            video_bytes, duration, width, height = download_clip(clip_url)
+            video_url, duration, width, height = extract_clip_url(clip_url)
 
-            if video_bytes:
-                caption = (clip.get("description") or "").strip()
-                if caption:
-                    caption += f"\n\n📎 Пост: {post_url}"
-                else:
-                    caption = f"📎 Пост: {post_url}"
+            caption = (clip.get("description") or "").strip()
+            caption = f"{caption}\n\n📎 Пост: {post_url}" if caption else f"📎 Пост: {post_url}"
 
-                # Отправляем как нативное видео через multipart
-                success = send_video_multipart(
-                    video_bytes, caption[:1024], duration, width, height
-                )
-                if success:
-                    print("✅ КЛИП ОТПРАВЛЕН КАК НАТИВНОЕ ВИДЕО!")
+            if video_url:
+                # Вариант 1: Telegram сам скачивает по прямой ссылке
+                if send_video_url(video_url, caption[:1024], duration, width, height):
+                    print("✅ КЛИП ОТПРАВЛЕН КАК НАТИВНОЕ ВИДЕО (по ссылке)")
                     return
-                print("⚠️ Не удалось отправить как видео")
-            else:
-                print("⚠️ Не удалось скачать клип")
+                # Вариант 2: скачиваем и отправляем файлом
+                video_bytes = download_bytes(video_url)
+                if video_bytes and send_video_bytes(video_bytes, caption[:1024], duration, width, height):
+                    print("✅ КЛИП ОТПРАВЛЕН КАК НАТИВНОЕ ВИДЕО (файлом)")
+                    return
 
-            # Фолбэк — фото со ссылкой
-            preview = (clip.get("first_frame") or clip.get("image") or [{}])[-1].get("url")
-            if preview:
-                caption = f"🎬 {clip.get('title', 'VK Клип')}\n{clip.get('description', '')}\n\n📎 Клип: {clip_url}\n📎 Пост: {post_url}".strip()
-                send_photo(preview, caption[:1024])
+            # Фолбэк — превью со ссылкой
+            print("⚠️ Фолбэк: превью со ссылкой")
+            frames = clip.get("first_frame") or clip.get("image") or []
+            if frames:
+                preview = frames[-1].get("url")
+                fb_caption = f"🎬 {clip.get('title', 'VK Клип')}\n{clip.get('description', '')}\n\n📎 Клип: {clip_url}\n📎 Пост: {post_url}".strip()
+                send_photo(preview, fb_caption[:1024])
             return
 
         # === ФОТО ===
         if attachment.get("type") == "photo":
-            photo = attachment.get("photo", {})
-            sizes = photo.get("sizes", [])
+            sizes = attachment.get("photo", {}).get("sizes", [])
             if sizes:
                 best = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
-                caption = f"{text}\n\n📎 {post_url}".strip()
-                send_photo(best.get("url"), caption[:1024])
+                send_photo(best.get("url"), f"{text}\n\n📎 {post_url}".strip()[:1024])
                 return
 
     # Обычный текст
-    caption = f"{text}\n\n📎 {post_url}".strip() or f"📎 {post_url}"
-    send_text(caption[:4096])
+    send_text((f"{text}\n\n📎 {post_url}".strip() or f"📎 {post_url}")[:4096])
 
 
-def download_clip(clip_url):
-    """Скачивает клип через yt-dlp прямо в память (bytes)."""
+def extract_clip_url(clip_url):
+    """Получаем прямую MP4-ссылку через yt-dlp."""
     try:
-        ydl_opts = {
-            "format": "best[ext=mp4]/best",
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": False,
-        }
-
+        ydl_opts = {"format": "best[ext=mp4]/best", "quiet": True, "no_warnings": True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(clip_url, download=False)
 
-            # Ищем лучшую MP4-ссылку
-            video_url = None
-            duration = info.get("duration", 8) or 8
-            width = info.get("width", 720) or 720
-            height = info.get("height", 1280) or 1280
+        duration = info.get("duration") or 8
+        width = info.get("width") or 720
+        height = info.get("height") or 1280
 
-            if "url" in info:
-                video_url = info["url"]
-            elif "formats" in info:
-                mp4_formats = [
-                    f for f in info["formats"]
-                    if f.get("ext") == "mp4" and f.get("url")
-                ]
-                if mp4_formats:
-                    best = max(mp4_formats, key=lambda f: f.get("height", 0) or 0)
-                    video_url = best["url"]
+        video_url = info.get("url")
+        if not video_url and info.get("formats"):
+            mp4s = [f for f in info["formats"] if f.get("ext") == "mp4" and f.get("url")]
+            if mp4s:
+                video_url = max(mp4s, key=lambda f: f.get("height") or 0).get("url")
 
-            if not video_url:
-                print("Не найдена MP4-ссылка")
-                return None, duration, width, height
-
-            print(f"Скачиваем MP4: {video_url[:80]}...")
-
-            # Скачиваем файл в память
-            response = requests.get(video_url, stream=True, timeout=20)
-            if response.status_code == 200:
-                buf = BytesIO()
-                for chunk in response.iter_content(chunk_size=8192):
-                    buf.write(chunk)
-                buf.seek(0)
-                print(f"✅ Скачано {buf.getbuffer().nbytes} байт")
-                return buf, duration, width, height
-            else:
-                print(f"Ошибка скачивания: {response.status_code}")
-                return None, duration, width, height
-
+        if video_url:
+            print("✅ yt-dlp нашёл прямую MP4-ссылку")
+        else:
+            print("⚠️ yt-dlp не нашёл MP4-ссылку")
+        return video_url, duration, width, height
     except Exception as e:
-        print(f"Ошибка yt-dlp: {e}")
+        print("Ошибка yt-dlp:", e)
         return None, 8, 720, 1280
 
 
-def send_video_multipart(video_bytes, caption, duration, width, height):
-    """Отправляет видео в Telegram через multipart/form-data."""
+def download_bytes(url):
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendVideo"
-        files = {
-            "video": ("video.mp4", video_bytes, "video/mp4")
-        }
-        data = {
-            "chat_id": TG_CHAT_ID,
-            "caption": caption,
-            "supports_streaming": "true",
-            "duration": str(duration),
-            "width": str(width),
-            "height": str(height),
-        }
-        response = requests.post(url, files=files, data=data, timeout=30)
-        result = response.json()
-        print(f"Telegram sendVideo: {json.dumps(result)[:200]}")
-        return result.get("ok", False)
+        r = requests.get(url, timeout=20)
+        if r.status_code == 200:
+            print("✅ Скачано байт:", len(r.content))
+            return r.content
+        print("Ошибка скачивания:", r.status_code)
     except Exception as e:
-        print(f"Ошибка отправки видео: {e}")
+        print("Ошибка скачивания:", e)
+    return None
+
+
+def send_video_url(video_url, caption, duration, width, height):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendVideo",
+            json={
+                "chat_id": TG_CHAT_ID,
+                "video": video_url,
+                "caption": caption,
+                "supports_streaming": True,
+                "duration": duration,
+                "width": width,
+                "height": height,
+            },
+            timeout=30,
+        )
+        res = r.json()
+        print("sendVideo (url):", json.dumps(res, ensure_ascii=False)[:200])
+        return res.get("ok", False)
+    except Exception as e:
+        print("Ошибка sendVideo (url):", e)
+        return False
+
+
+def send_video_bytes(video_bytes, caption, duration, width, height):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendVideo",
+            data={
+                "chat_id": TG_CHAT_ID,
+                "caption": caption,
+                "supports_streaming": "true",
+                "duration": str(duration),
+                "width": str(width),
+                "height": str(height),
+            },
+            files={"video": ("video.mp4", video_bytes, "video/mp4")},
+            timeout=30,
+        )
+        res = r.json()
+        print("sendVideo (file):", json.dumps(res, ensure_ascii=False)[:200])
+        return res.get("ok", False)
+    except Exception as e:
+        print("Ошибка sendVideo (file):", e)
         return False
 
 
 def send_photo(photo_url, caption):
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
-        response = requests.post(url, json={
-            "chat_id": TG_CHAT_ID,
-            "photo": photo_url,
-            "caption": caption,
-        }, timeout=20)
-        print(f"Telegram sendPhoto: {response.json()}")
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+            json={"chat_id": TG_CHAT_ID, "photo": photo_url, "caption": caption},
+            timeout=20,
+        )
+        print("sendPhoto:", r.json().get("ok"))
     except Exception as e:
-        print(f"Ошибка отправки фото: {e}")
+        print("Ошибка sendPhoto:", e)
 
 
 def send_text(text):
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        response = requests.post(url, json={
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-        }, timeout=20)
-        print(f"Telegram sendText: {response.json()}")
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text},
+            timeout=20,
+        )
+        print("sendMessage:", r.json().get("ok"))
     except Exception as e:
-        print(f"Ошибка отправки текста: {e}")
+        print("Ошибка sendMessage:", e)
