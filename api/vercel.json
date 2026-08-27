@@ -1,0 +1,11 @@
+{
+  "functions": {
+    "api/callback.py": {
+      "runtime": "@vercel/python@4.5.0",
+      "maxDuration": 10
+    }
+  },
+  "routes": [
+    { "src": "/api/callback", "dest": "/api/callback.py" }
+  ]
+}
