@@ -1,8 +1,0 @@
-{
-  "name": "vk-tg-bot",
-  "version": "1.0.0",
-  "description": "Кросспостинг ВК в Телеграм",
-  "engines": {
-    "node": "24.x"
-  }
-}
